@@ -1,0 +1,187 @@
+diff --git a/camx/src/core/chi/camxchinodewrapper.cpp b/camx/src/core/chi/camxchinodewrapper.cpp
+index 8b1084bb..a024f825 100755
+--- a/camx/src/core/chi/camxchinodewrapper.cpp
++++ b/camx/src/core/chi/camxchinodewrapper.cpp
+@@ -951,7 +951,12 @@ CDKResult ChiNodeWrapper::FNQueryDataSourceCapability(
+     CHINISSENSORMODE*       pNISSensorMode      = NULL;
+     NCSSensorType           sensorType          = NCSMaxType;
+     NCSIntfType             ncsIntfType         = NCSIntfType::MaxNCSIntfType;
+-    BOOL                    enableQSEE2         = HwInterface::GetInstance()->GetStaticSettings()->enableNCSQSEE2;
++    // [CQ8750s] Force QSEE1: the enableNCSQSEE2 setting does not take effect on this LE build, and
++    // QSEE2 direct channel data delivery is unverified here, while QSEE1 (sscrpcd/QMI) is verified
++    // delivering gyro/accel at 400Hz into GME with EIS enabled (2026-10-23 experiment). Revisit if
++    // QSEE2 shared-memory data plane is ever validated.
++    BOOL                    enableQSEE2         = FALSE;
++    CAMX_UNREFERENCED_PARAM(HwInterface::GetInstance()->GetStaticSettings()->enableNCSQSEE2);
+ 
+ #if !defined (NCS_DISABLED)
+     if (NULL == pDataSourceCaps)
+@@ -1192,7 +1197,9 @@ CDKResult ChiNodeWrapper::FNGetDataSource(
+     BOOL                        isSensorValid       = TRUE;
+     NCSIntfType                 ncsIntfType         = NCSIntfType::MaxNCSIntfType;
+     ChiNodeWrapper*             pNode               = static_cast<ChiNodeWrapper*>(hChiSession);
+-    BOOL                        enableQSEE2         = HwInterface::GetInstance()->GetStaticSettings()->enableNCSQSEE2;
++    // [CQ8750s] Force QSEE1 — see comment in CHINodeGetDataSourceCaps() above.
++    BOOL                        enableQSEE2         = FALSE;
++    CAMX_UNREFERENCED_PARAM(HwInterface::GetInstance()->GetStaticSettings()->enableNCSQSEE2);
+ 
+     if ((NULL != pDataSource) && (NULL != pDataSourceConfig))
+     {
+diff --git a/camx/src/core/ncs/camxncsintfqsee.cpp b/camx/src/core/ncs/camxncsintfqsee.cpp
+index 33cb7ffc..8a09279b 100755
+--- a/camx/src/core/ncs/camxncsintfqsee.cpp
++++ b/camx/src/core/ncs/camxncsintfqsee.cpp
+@@ -544,6 +544,33 @@ CamxResult NCSIntfQSEE::SendConfigRequest(
+                         sensorType);
+ 
+         m_sensorConnList[connIndex].suid = *pSUID;
++
++        // [CQ8750s] Clamp the requested sample rate to the max rate advertised by the sensor
++        // (SNS_STD_SENSOR_ATTRID_RATES). GME requests gyro_frequency from EIS chromatix (832Hz for
++        // sc5a0xs) or 960Hz default, but ICM42607 normal mode max ODR is 200Hz; the sensors PD
++        // rejects the config with SNS_STD_ERROR_INVALID_VALUE (error event 5) and the stream dies.
++        // Note: rates[] is copied verbatim from the SSC attribute in arrival order — not sorted,
++        // and may contain trailing zeros — so clamp to the largest non-zero advertised rate.
++        {
++            QSEESensorCap* pCap = &m_sensorInfo[sensorType].sensorCaps;
++            FLOAT maxRate = 0.0f;
++            for (UINT i = 0; i < pCap->numRates; i++)
++            {
++                if (pCap->rates[i] > maxRate)
++                {
++                    maxRate = pCap->rates[i];
++                }
++            }
++            if ((0 < maxRate) && (pSensorConfig->samplingRate > maxRate))
++            {
++                CAMX_LOG_ERROR(CamxLogGroupNCS, "Sensor %d: clamped sample rate %f -> %f (sensor max)",
++                              sensorType,
++                              pSensorConfig->samplingRate,
++                              maxRate);
++                pSensorConfig->samplingRate = maxRate;
++            }
++        }
++
+         CAMX_LOG_CONFIG(CamxLogGroupNCS, "sensor type %d suidH 0x%x suidL 0x%x SampleRate %f ReportRate %d ",
+                         pSensorConfig->sensorType,
+                         pSUID->m_high,
+diff --git a/sensors-ship/Makefile.am b/sensors-ship/Makefile.am
+index 32eb12a8..391dc9f3 100755
+--- a/sensors-ship/Makefile.am
++++ b/sensors-ship/Makefile.am
+@@ -13,7 +13,8 @@ dirs = registry    \
+        rpc/direct_channel_stub   \
+        test/USTA/native          \
+        test/see_salt             \
+-       test/see_workhorse
++       test/see_workhorse        \
++       test/imu_qmi_recorder
+ 
+ SUBDIRS = $(dirs)
+ 
+diff --git a/sensors-ship/configure.ac b/sensors-ship/configure.ac
+index 4bd677d4..2f8d4da0 100755
+--- a/sensors-ship/configure.ac
++++ b/sensors-ship/configure.ac
+@@ -160,6 +160,7 @@ AC_CONFIG_FILES([                              \
+         test/see_salt/Makefile                 \
+         test/qsh_dci_logger/Makefile           \
+         test/see_workhorse/Makefile            \
++        test/imu_qmi_recorder/Makefile         \
+         sensors-see.pc
+         ])
+ AC_OUTPUT
+diff --git a/sensors-ship/registry/config/sensors/common/sns_tilt_to_wake.json b/sensors-ship/registry/config/sensors/common/sns_tilt_to_wake.json
+index 390dc0d1..6a75c935 100755
+--- a/sensors-ship/registry/config/sensors/common/sns_tilt_to_wake.json
++++ b/sensors-ship/registry/config/sensors/common/sns_tilt_to_wake.json
+@@ -1,7 +1,7 @@
+ {
+   "config": {
+     "hw_platform": [ "MTP", "Dragon", "Surf", "IDP", "QRD", "IOT", "RCM"],
+-    "soc_id": ["557", "577", "618"]
++    "soc_id": ["557", "577", "618", "639", "705"]
+   },
+   "sns_tilt_to_wake": {
+     "owner": "sns_tilt_to_wake",
+diff --git a/sensors-ship/registry/config/sensors/sun/pakala_qrd_default_sensors.json b/sensors-ship/registry/config/sensors/sun/pakala_qrd_default_sensors.json
+index bca0edd8..1d5d4c09 100755
+--- a/sensors-ship/registry/config/sensors/sun/pakala_qrd_default_sensors.json
++++ b/sensors-ship/registry/config/sensors/sun/pakala_qrd_default_sensors.json
+@@ -52,7 +52,7 @@
+             ".attr_1": {
+                 "owner": "suid",
+                 "id": { "type": "int", "ver": "0", "data": "0" },
+-                "val": { "type": "str", "ver": "0", "data": "icm4x6xa" }
++                "val": { "type": "str", "ver": "0", "data": "icm4x6xx" }
+             }
+         },
+ 
+diff --git a/sensors-ship/registry/config/sensors/sun/pakala_qrd_icm4x6xx_0.json b/sensors-ship/registry/config/sensors/sun/pakala_qrd_icm4x6xx_0.json
+index 9795d5ba..3762b777 100755
+--- a/sensors-ship/registry/config/sensors/sun/pakala_qrd_icm4x6xx_0.json
++++ b/sensors-ship/registry/config/sensors/sun/pakala_qrd_icm4x6xx_0.json
+@@ -2,7 +2,7 @@
+   "config":
+   {
+     "hw_platform": ["QRD"],
+-    "soc_id": ["618"]
++    "soc_id": ["618", "639", "705"]
+   },
+   "icm4x6xx_0":{
+     "owner": "icm4x6xx",
+@@ -110,9 +110,6 @@
+       "slave_config":{ "type": "int", "ver": "0",
+         "data": "0"
+       },
+-      "i3c_address":{ "type": "int", "ver": "0",
+-        "data": "10"
+-      },
+       "min_bus_speed_khz":{ "type": "int", "ver": "0",
+         "data": "0"
+       },
+@@ -123,7 +120,7 @@
+         "data": "0"
+       },
+       "dri_irq_num":{ "type": "int", "ver": "0",
+-        "data": "80"
++        "data": "81"
+       },
+       "irq_pull_type":{ "type": "int", "ver": "0",
+         "data": "0"
+@@ -135,7 +132,7 @@
+         "data": "0"
+       },
+       "irq_trigger_type":{ "type": "int", "ver": "0",
+-        "data": "4"
++        "data": "3"
+       },
+       "num_rail":{ "type": "int", "ver": "0",
+         "data": "1"
+@@ -148,24 +145,15 @@
+       },
+       "rigid_body_type":{ "type": "int", "ver": "0",
+         "data": "0"
+-      },
+-      "min_odr":{ "type": "int", "ver": "0",
+-        "data": "20"
+-      },
+-      "max_odr":{ "type": "int", "ver": "0",
+-        "data": "500"
+-      },
+-      "max_low_latency_odr":{ "type": "int", "ver": "0",
+-        "data": "2000"
+       }
+     },
+     ".orient":{
+       "owner": "icm4x6xx",
+       "x":{ "type": "str", "ver": "0",
+-        "data": "+y"
++        "data": "+x"
+       },
+       "y":{ "type": "str", "ver": "0",
+-        "data": "-x"
++        "data": "+y"
+       },
+       "z":{ "type": "str", "ver": "0",
+         "data": "+z"

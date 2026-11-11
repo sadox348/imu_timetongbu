@@ -1,0 +1,58 @@
+From: magine_yan
+Subject: [CQ8750s][REVERT] adsp: icm4x6xx restore normal-mode ODR cap to 1000Hz
+
+This is an archive patch documenting the revert of the experimental
+normal-mode ODR cap raise in the ICM-42688 SSC driver. It records the
+experiment and its conclusion; the source tree is already back at the
+stock value, so applying this patch to a stock tree is a no-op.
+
+Experiment history (all measured on sun/Goertek QCS8750 board, camera
+idle, imu_qmi_recorder over QMI/sscrpcd):
+
+  ICM4X6XX_MAX_LOW_LATENCY_RATE   result
+  -----------------------------   -------------------------------------
+  ICM4X6XX_ODR_1000 (stock)       1006.7 Hz actual, stable
+  ICM4X6XX_ODR_2000               2013.3 Hz actual, stable
+                                  (GYRO_ODR reg 0b0101, DS-000347)
+  ICM4X6XX_ODR_4000               3911 Hz actual (0b0110 ODR tick runs
+                                  ~2.2% slow), interval p50 255us,
+                                  p99 260us, no gaps - IMU-only OK
+
+Conclusion / reason for reverting to 1000:
+  Concurrent load of a 4000 Hz gyro+accel subscription with a 720p@30
+  camera stream twice caused the board to drop off USB (suspected
+  power-supply collapse: ADSP sensor engine at full ODR + ISP/camera
+  load; PM8012 headroom is known to be tight). 2000 Hz concurrent
+  capture was stable. For the timestamp-alignment use case the
+  measured accuracy at 1000 Hz (p50 247us / p99 492us nearest-sample
+  distance to frame exposure center) is already within the +-0.5 ms
+  target, so the stock cap is kept.
+
+The single source change being reverted (hal.h):
+
+  - /* [CQ8750s] allow 4000Hz normal-mode ODR (ICM-42688 GYRO_ODR reg 0b0110);
+  -  * stock value ICM4X6XX_ODR_1000 rejected any request >1000Hz at
+  -  * sns_icm4x6xx_sensor_island.c add_new_request() with SNS_RC_INVALID_VALUE */
+  - #define ICM4X6XX_MAX_LOW_LATENCY_RATE ICM4X6XX_ODR_4000
+  + #define ICM4X6XX_MAX_LOW_LATENCY_RATE ICM4X6XX_ODR_1000
+
+To re-enable high-ODR experiments, change ICM4X6XX_MAX_LOW_LATENCY_RATE
+in ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal.h and rebuild ADSP
+(see VERIFICATION.md in this directory).
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal.h b/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal.h
+--- a/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal.h
++++ b/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal.h
+@@ -631,7 +631,7 @@ typedef enum icm4x6xx_gyro_fsr
+   #define ICM4X6XX_MAX_LOW_LATENCY_RATE ICM4X6XX_ODR_8000
+ #else
+-  #define ICM4X6XX_MAX_LOW_LATENCY_RATE ICM4X6XX_ODR_4000
++  #define ICM4X6XX_MAX_LOW_LATENCY_RATE ICM4X6XX_ODR_1000
+ #endif /* ICM4X6XX_ENABLE_SEE_RBX */
+--
+2.25.1

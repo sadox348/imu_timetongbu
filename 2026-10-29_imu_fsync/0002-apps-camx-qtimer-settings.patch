@@ -1,0 +1,11 @@
+diff --git a/poky/meta-goertek/recipes-bsp/firmware/files/camxoverridesettings.txt b/poky/meta-goertek/recipes-bsp/firmware/files/camxoverridesettings.txt
+index b5e08a55..239156a7 100755
+--- a/poky/meta-goertek/recipes-bsp/firmware/files/camxoverridesettings.txt
++++ b/poky/meta-goertek/recipes-bsp/firmware/files/camxoverridesettings.txt
+@@ -1 +1,3 @@
+-multiCameraLogicalXMLFile=goertek.xml
+\ No newline at end of file
++multiCameraLogicalXMLFile=goertek.xml
++enableNCSQSEE2=FALSE
++enableQTimer=true
+\ No newline at end of file

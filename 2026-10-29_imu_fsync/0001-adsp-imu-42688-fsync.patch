@@ -1,0 +1,887 @@
+diff --git a/LPAIDSP.HT.1.1/adsp_proc/core/systemdrivers/GPIOInt/src/uimage/uGPIOInt.c b/LPAIDSP.HT.1.1/adsp_proc/core/systemdrivers/GPIOInt/src/uimage/uGPIOInt.c
+index 3ceca2aee..d4b9221f3 100755
+--- a/LPAIDSP.HT.1.1/adsp_proc/core/systemdrivers/GPIOInt/src/uimage/uGPIOInt.c
++++ b/LPAIDSP.HT.1.1/adsp_proc/core/systemdrivers/GPIOInt/src/uimage/uGPIOInt.c
+@@ -79,6 +79,40 @@ static ULogHandle huGPIOIntLog;
+ 
+ static GPIOIntHandle hGPIOIntQDI;
+ 
++/*==============================================================================
++  Data: DIR_CONN fallback
++================================================================================
++  [CQ8750s] Goertek: GPIOs absent from the PDC mux table (e.g. pakala GPIO206,
++  wired to ICM42607 INT1 on the sun board) cannot be delivered to a user PD
++  through the PDC path, since pdcGpio_config() only supports muxed GPIOs and
++  GPIOInt_DirConn.c is not linked into user images (gpioint.scons links only
++  uGPIOInt.c into USES_SENSOR_IMG). This fallback programs a TLMM direct
++  connect (DIR_CONN) slot locally when the PDC configuration fails, so the
++  interrupt still reaches this PD through one of the 6 direct-connect QURT
++  interrupt vectors. Mirrors GPIOInt_DirConn.c DirConnGpioInternal_Toggle /
++  SetDirConnIntrPolarity and the pakala GPIOIntBSP.c DirConnCfgMap.
++==============================================================================*/
++
++/* Direct-connect QURT interrupt vectors from pakala GPIOIntBSP.c DirConnCfgMap */
++#define UGPIOINT_DIRCONN_SLOTS        6
++
++typedef struct
++{
++  uint16_t nGpio;                    /* GPIO routed to this slot */
++  uint16_t nInt;                     /* QURT interrupt vector for this slot */
++  uint8_t  bActive;                  /* Slot in use */
++} uGPIOIntDirConnSlotType;
++
++static uGPIOIntDirConnSlotType uGPIOIntDirConnSlots[UGPIOINT_DIRCONN_SLOTS] =
++{
++  { UGPIOINT_NONE, 79,  0 },
++  { UGPIOINT_NONE, 86,  0 },
++  { UGPIOINT_NONE, 28,  0 },
++  { UGPIOINT_NONE, 66,  0 },
++  { UGPIOINT_NONE, 117, 0 },
++  { UGPIOINT_NONE, 130, 0 }
++};
++
+ 
+ /*==============================================================================
+   Functions
+@@ -373,6 +407,207 @@ int32_t uGPIOInt_Init
+   return UGPIOINT_SUCCESS;
+ }
+ 
++/* =============================================================================
++**  Function : uGPIOIntInternal_DirConnConfig
++** ===========================================================================*/
++/**
++  [CQ8750s] Goertek: configures a TLMM direct-connect slot for a GPIO not
++  routed through PDC.
++
++  Mirrors GPIOInt_DirConn.c: routes the GPIO into a free DIR_CONN slot,
++  programs DET/POL for the requested trigger and enables the connection.
++  Returns the QURT interrupt vector for the slot so the existing
++  qurt_isr_register2()/qurt_interrupt_enable() paths keep working unchanged.
++
++  Dual-edge is not supported by the direct-connect hardware.
++
++  @param[in]  nGpio     GPIO number
++  @param[in]  eTrigger  Interrupt trigger at TLMM level
++  @param[out] pnInt     QURT interrupt vector assigned to this GPIO
++
++  @return
++  UGPIOINT_SUCCESS -- Slot configured
++  UGPIOINT_ERROR   -- No free slot or unsupported trigger
++
++  @dependencies
++  None.
++*/
++
++static int32_t uGPIOIntInternal_DirConnConfig
++(
++  uint32_t            nGpio,
++  uGPIOIntTriggerType eTrigger,
++  uint32_t           *pnInt
++)
++{
++  uint32_t nIdx;
++  uint32_t nPol = 1, nDet = 0;
++  uint32_t eHALResult;
++
++  if (UGPIOINT_TRIGGER_DUAL_EDGE == eTrigger)
++  {
++    uGPIOIntInternal_Log(
++      1, "%s: FAIL. DIR_CONN does not support dual edge (GPIO %d)",
++      __func__, nGpio);
++    return UGPIOINT_ERROR;
++  }
++
++  for (nIdx = 0; nIdx < UGPIOINT_DIRCONN_SLOTS; nIdx++)
++  {
++    if (!uGPIOIntDirConnSlots[nIdx].bActive)
++    {
++      break;
++    }
++  }
++  if (nIdx >= UGPIOINT_DIRCONN_SLOTS)
++  {
++    uGPIOIntInternal_Log(
++      1, "%s: FAIL. No free DIR_CONN slot (GPIO %d)", __func__, nGpio);
++    return UGPIOINT_ERROR;
++  }
++
++  /* Trigger to DET/POL, per GPIOInt_Summary.c SummaryGpioInternal_SetTrigger */
++  switch (eTrigger)
++  {
++    case UGPIOINT_TRIGGER_HIGH:
++      nPol = 1;
++      nDet = 0;
++      break;
++
++    case UGPIOINT_TRIGGER_LOW:
++      nPol = 0;
++      nDet = 0;
++      break;
++
++    case UGPIOINT_TRIGGER_RISING:
++      nPol = 1;
++      nDet = 1;
++      break;
++
++    case UGPIOINT_TRIGGER_FALLING:
++      nPol = 1;
++      nDet = 2;
++      break;
++
++    default:
++      nPol = 1;
++      nDet = 0;
++      break;
++  }
++
++  /* Select GPIO into the DIR_CONN slot and set polarity on the slot */
++  eHALResult = HAL_tlmmtile_SetDirConn(
++                 nIdx, HAL_TLMMTILE_FIELD_DIRCONNINTRCFG_SEL, nGpio);
++  if (HALTLMMTILE_ERR == eHALResult)
++  {
++    uGPIOIntInternal_Log(
++      1, "%s: FAIL. Could not set DIR_CONN %d SEL (GPIO %d)",
++      __func__, nIdx, nGpio);
++    return UGPIOINT_ERROR;
++  }
++
++  eHALResult = HAL_tlmmtile_SetDirConn(
++                 nIdx, HAL_TLMMTILE_FIELD_DIRCONNINTRCFG_POL, nPol);
++  if (HALTLMMTILE_ERR == eHALResult)
++  {
++    uGPIOIntInternal_Log(
++      1, "%s: FAIL. Could not set DIR_CONN %d POL (GPIO %d)",
++      __func__, nIdx, nGpio);
++    return UGPIOINT_ERROR;
++  }
++
++  /* Program DET/POL and enable direct-connect on the GPIO itself */
++  eHALResult = HAL_tlmmtile_Set(
++                 nGpio, HAL_TLMMTILE_REG_INTRCFG,
++                 HAL_TLMMTILE_FIELD_INTRCFG_DET, nDet);
++  if (HALTLMMTILE_ERR == eHALResult)
++  {
++    uGPIOIntInternal_Log(
++      1, "%s: FAIL. Could not set DET for GPIO %d", __func__, nGpio);
++    return UGPIOINT_ERROR;
++  }
++
++  eHALResult = HAL_tlmmtile_Set(
++                 nGpio, HAL_TLMMTILE_REG_INTRCFG,
++                 HAL_TLMMTILE_FIELD_INTRCFG_POL, nPol);
++  if (HALTLMMTILE_ERR == eHALResult)
++  {
++    uGPIOIntInternal_Log(
++      1, "%s: FAIL. Could not set POL for GPIO %d", __func__, nGpio);
++    return UGPIOINT_ERROR;
++  }
++
++  eHALResult = HAL_tlmmtile_Set(
++                 nGpio, HAL_TLMMTILE_REG_INTRCFG,
++                 HAL_TLMMTILE_FIELD_INTRCFG_DIRCONNEN, 1);
++  if (HALTLMMTILE_ERR == eHALResult)
++  {
++    uGPIOIntInternal_Log(
++      1, "%s: FAIL. Could not set DIRCONNEN for GPIO %d", __func__, nGpio);
++    return UGPIOINT_ERROR;
++  }
++
++  uGPIOIntDirConnSlots[nIdx].nGpio   = (uint16_t)nGpio;
++  uGPIOIntDirConnSlots[nIdx].bActive = 1;
++
++  if (pnInt)
++  {
++    *pnInt = uGPIOIntDirConnSlots[nIdx].nInt;
++  }
++
++  uGPIOIntInternal_Log(
++    2, "%s: SUCCESS. GPIO %d on DIR_CONN slot %d, interrupt %d, trigger %d",
++    __func__, nGpio, nIdx, uGPIOIntDirConnSlots[nIdx].nInt, eTrigger);
++
++  return UGPIOINT_SUCCESS;
++}
++
++/* =============================================================================
++**  Function : uGPIOIntInternal_DirConnUnconfig
++** ===========================================================================*/
++/**
++  [CQ8750s] Goertek: releases a TLMM direct-connect slot previously
++  configured for nGpio.
++
++  @param[in]  nGpio   GPIO number
++
++  @return
++  None.
++
++  @dependencies
++  None.
++*/
++
++static void uGPIOIntInternal_DirConnUnconfig
++(
++  uint32_t nGpio
++)
++{
++  uint32_t nIdx;
++
++  for (nIdx = 0; nIdx < UGPIOINT_DIRCONN_SLOTS; nIdx++)
++  {
++    if (uGPIOIntDirConnSlots[nIdx].bActive &&
++        uGPIOIntDirConnSlots[nIdx].nGpio == (uint16_t)nGpio)
++    {
++      break;
++    }
++  }
++  if (nIdx >= UGPIOINT_DIRCONN_SLOTS)
++  {
++    return;
++  }
++
++  HAL_tlmmtile_Set(
++    nGpio, HAL_TLMMTILE_REG_INTRCFG,
++    HAL_TLMMTILE_FIELD_INTRCFG_DIRCONNEN, 0);
++  HAL_tlmmtile_SetDirConn(
++    nIdx, HAL_TLMMTILE_FIELD_DIRCONNINTRCFG_SEL, 0);
++
++  uGPIOIntDirConnSlots[nIdx].bActive = 0;
++  uGPIOIntDirConnSlots[nIdx].nGpio   = UGPIOINT_NONE;
++}
++
+ /* =============================================================================
+ **  Function : uGPIOIntInternal_ConfigPDC
+ ** ===========================================================================*/
+@@ -472,10 +707,31 @@ int32_t uGPIOIntInternal_ConfigPDC
+   /* Not able to configure at PDC */
+   else
+   {
++    /*
++     * [CQ8750s] Goertek: GPIO is not in the PDC mux table (e.g. pakala
++     * GPIO206 on the sun board). Fall back to a TLMM direct-connect slot
++     * so the interrupt still reaches this PD.
++     */
+     uGPIOIntInternal_Log(
+-      2, "%s: FAIL. Could not configure PDC (err %d)", __func__, eResult);
++      2, "%s: WARN. Could not configure PDC (err %d), trying DIR_CONN",
++      __func__, eResult);
+ 
+-    return UGPIOINT_ERROR;
++    if (uGPIOIntInternal_DirConnConfig(nGpio, eTrigger, &nInt) !=
++        UGPIOINT_SUCCESS)
++    {
++      uGPIOIntInternal_Log(
++        2, "%s: FAIL. Could not configure PDC or DIR_CONN (GPIO %d)",
++        __func__, nGpio);
++
++      return UGPIOINT_ERROR;
++    }
++
++    if (pnInt)
++    {
++      *pnInt = nInt;
++    }
++
++    return UGPIOINT_SUCCESS;
+   }
+ 
+   if (pnInt)
+@@ -682,6 +938,9 @@ int32_t uGPIOInt_DeregisterInterrupt
+ 
+   pdcGpio_unconfig(nGpio);
+ 
++  /* [CQ8750s] Goertek: release DIR_CONN slot if the fallback was used */
++  uGPIOIntInternal_DirConnUnconfig(nGpio);
++
+   eHALResult = HAL_tlmmtile_Set(
+                  nGpio, HAL_TLMMTILE_REG_INTRCFG,
+                  HAL_TLMMTILE_FIELD_INTRCFG_WAKEUP_EN, 0);
+diff --git a/LPAIDSP.HT.1.1/adsp_proc/qsh_platform/chipset/pakala/qsh/sns_interface_defs.h b/LPAIDSP.HT.1.1/adsp_proc/qsh_platform/chipset/pakala/qsh/sns_interface_defs.h
+index e2e4e724e..a612a2fc0 100755
+--- a/LPAIDSP.HT.1.1/adsp_proc/qsh_platform/chipset/pakala/qsh/sns_interface_defs.h
++++ b/LPAIDSP.HT.1.1/adsp_proc/qsh_platform/chipset/pakala/qsh/sns_interface_defs.h
+@@ -36,7 +36,7 @@
+ #define _ICM4X6XX_I2C_ADDR_1                105
+ #define _ICM4X6XX_I3C_ADDR_0                16
+ #define _ICM4X6XX_I3C_ADDR_1                17
+-#define _ICM4X6XX_IRQ_NUM_0                 80
++#define _ICM4X6XX_IRQ_NUM_0                 81
+ #define _ICM4X6XX_IRQ_NUM_1                 81
+ #define _ICM4X6XX_IRQ_MODE                  1
+ 
+@@ -51,7 +51,7 @@
+ #define _ICM4X6XA_I2C_ADDR_1                105
+ #define _ICM4X6XA_I3C_ADDR_0                16
+ #define _ICM4X6XA_I3C_ADDR_1                17
+-#define _ICM4X6XA_IRQ_NUM_0                 24         // MSM GPIO 206 → SSC pin 24
++#define _ICM4X6XA_IRQ_NUM_0                 81         
+ #define _ICM4X6XA_IRQ_MODE                  1
+ 
+ 
+diff --git a/LPAIDSP.HT.1.1/adsp_proc/sdc_core/systemdrivers/GPIOInt/inc/uimage/pakala/uGPIOIntInternal.h b/LPAIDSP.HT.1.1/adsp_proc/sdc_core/systemdrivers/GPIOInt/inc/uimage/pakala/uGPIOIntInternal.h
+index ffb1b3d89..047d3b60e 100755
+--- a/LPAIDSP.HT.1.1/adsp_proc/sdc_core/systemdrivers/GPIOInt/inc/uimage/pakala/uGPIOIntInternal.h
++++ b/LPAIDSP.HT.1.1/adsp_proc/sdc_core/systemdrivers/GPIOInt/inc/uimage/pakala/uGPIOIntInternal.h
+@@ -50,7 +50,10 @@
+ #define MAX_NUMBER_OF_UGPIOS        10
+ 
+ /* uGPIOInt driver flags */
+-// #define UGPIOINTF_DIRPDC            0x02  /* Unused, can be repurposed */
++#define UGPIOINTF_DIRCONN           0x02  /* GPIO routed via a TLMM DIR_CONN SENSORS slot (GPIO not in the PDC mux table) */
++
++/* Enable the uGPIOInt DIR_CONN fallback path for this target */
++#define UGPIOINT_DIRCONN_SUPPORT
+ #define UGPIOINTF_WAKEUP            0x04
+ #define UGPIOINTF_REGISTERED        0x08
+ #define UGPIOINTF_ALL               0xFF
+diff --git a/LPAIDSP.HT.1.1/adsp_proc/sdc_core/systemdrivers/GPIOInt/src/uimage/uGPIOInt.c b/LPAIDSP.HT.1.1/adsp_proc/sdc_core/systemdrivers/GPIOInt/src/uimage/uGPIOInt.c
+index 8b22951b7..707d95679 100755
+--- a/LPAIDSP.HT.1.1/adsp_proc/sdc_core/systemdrivers/GPIOInt/src/uimage/uGPIOInt.c
++++ b/LPAIDSP.HT.1.1/adsp_proc/sdc_core/systemdrivers/GPIOInt/src/uimage/uGPIOInt.c
+@@ -73,6 +73,24 @@ static const uint32_t uIntTrigger[UGPIOINT_TRIGGER_DUAL_EDGE + 1] =
+   INTCF_TRIGGER_RISING
+ };
+ 
++#ifdef UGPIOINT_DIRCONN_SUPPORT
++/*
++ * DIR_CONN fallback for GPIOs not present in the PDC GPIO mux table
++ * (e.g. GPIO 206 on pakala). A TLMM DIR_CONN SENSORS slot routes the
++ * GPIO raw interrupt line to the dir_conn_irq_sensors PDC interrupt
++ * input, which is mapped to SDC interrupt vectors 41/42.
++ */
++#define UGPIOINT_DIRCONN_NUM_SLOTS     2
++#define UGPIOINT_DIRCONN_VECTOR_BASE   41
++#define UGPIOINT_DIRCONN_SLOT_FREE     0xFFFFFFFF
++
++static uint32_t uGPIOIntDirConnSlots[UGPIOINT_DIRCONN_NUM_SLOTS] =
++{
++  UGPIOINT_DIRCONN_SLOT_FREE,
++  UGPIOINT_DIRCONN_SLOT_FREE
++};
++#endif /* UGPIOINT_DIRCONN_SUPPORT */
++
+ 
+ /*==============================================================================
+   Functions
+@@ -239,6 +257,181 @@ static uint32_t uGPIOIntInternal_GetTrigger
+   return uIntTrigger[eTrigger];
+ }
+ 
++#ifdef UGPIOINT_DIRCONN_SUPPORT
++/* =============================================================================
++**  Function : uGPIOIntInternal_ConfigDirConn
++** ===========================================================================*/
++/**
++  Fallback for GPIOs that cannot be configured at the PDC GPIO mux.
++  Claims a free TLMM DIR_CONN SENSORS slot and routes the GPIO raw
++  interrupt line to the dir_conn_irq_sensors PDC interrupt input.
++
++  The PDC interrupt input is NOT enabled here: pdcInt_enable() requires
++  pdcInt_config() to have run first (it validates drv_num in the PDC
++  interrupt table), which happens inside
++  InterruptController_RegisterInterrupt(). The caller enables the PDC
++  side once registration has succeeded.
++
++  @param[in]  nGpio     GPIO number
++  @param[out] pnInt     Subsystem interrupt vector (41 + slot)
++
++  @return
++  UGPIOINT_SUCCESS -- Successfully configured DIR_CONN
++  UGPIOINT_ERROR -- No free DIR_CONN SENSORS slot
++
++  @dependencies
++  None.
++*/
++
++static int32_t uGPIOIntInternal_ConfigDirConn
++(
++  uint32_t  nGpio,
++  uint32_t *pnInt
++)
++{
++  uintptr_t nAddr;
++  uint32_t  nPage = 0, nVal;
++  uint32_t  nSlot;
++
++  for (nSlot = 0; nSlot < UGPIOINT_DIRCONN_NUM_SLOTS; nSlot++)
++  {
++    if (UGPIOINT_DIRCONN_SLOT_FREE == uGPIOIntDirConnSlots[nSlot])
++    {
++      break;
++    }
++  }
++
++  if (UGPIOINT_DIRCONN_NUM_SLOTS == nSlot)
++  {
++    return UGPIOINT_ERROR;
++  }
++
++  nAddr = HWIO_TLMM_DIR_CONN_INTRn_CFG_SENSORS_ADDR(TLMM_REG_REG_BASE, nSlot);
++
++  /* Program page select since we're accessing external registers */
++  if (nAddr & 0x80000000)
++  {
++    nPage = HWIO_INF(SDC_PAGE_SELECT, DDR_PAGE_SELECT);
++    HWIO_OUTF(SDC_PAGE_SELECT, DDR_PAGE_SELECT, 0);
++  }
++
++  /*
++   * Connect the GPIO to the DIR_CONN slot. POLARITY is always 1: the
++   * line is consumed by the PDC interrupt input and the PDC performs
++   * the actual trigger detection.
++   */
++  HWIO_TLMM_DIR_CONN_INTRn_CFG_SENSORS_OUTI(
++    TLMM_REG_REG_BASE, nSlot,
++    (HWIO_TLMM_DIR_CONN_INTRn_CFG_SENSORS_GPIO_SEL_BMSK & nGpio) |
++      HWIO_TLMM_DIR_CONN_INTRn_CFG_SENSORS_POLARITY_BMSK);
++
++  /* Route the GPIO raw interrupt line to the DIR_CONN router */
++  nAddr = HWIO_ADDRX(
++            TLMM_REG_REG_BASE +
++              (nGpio * UGPIOINT_GPIO_OFFSET), TLMM_GPIO_INTR_CFG0);
++
++  nVal = in_dword(nAddr);
++
++  /* Configure WAKEUP_ENABLE if WAKEUP_PRESENT is 1, as in the PDC path */
++  if ((nVal & HWIO_TLMM_GPIO_INTR_CFG0_WAKEUP_PRESENT_BMSK) ==
++        HWIO_TLMM_GPIO_INTR_CFG0_WAKEUP_PRESENT_BMSK)
++  {
++    nVal |= HWIO_TLMM_GPIO_INTR_CFG0_WAKEUP_ENABLE_BMSK;
++  }
++
++  nVal |= HWIO_TLMM_GPIO_INTR_CFG0_DIR_CONN_EN_BMSK;
++  out_dword(nAddr, nVal);
++
++  /* Restore the page select config */
++  if (nAddr & 0x80000000)
++  {
++    HWIO_OUTF(SDC_PAGE_SELECT, DDR_PAGE_SELECT, nPage);
++  }
++
++  uGPIOIntDirConnSlots[nSlot] = nGpio;
++  uGPIOIntData.aState[UGPIOINT_IDX(nGpio)].nFlags |= UGPIOINTF_DIRCONN;
++
++  if (pnInt)
++  {
++    *pnInt = UGPIOINT_DIRCONN_VECTOR_BASE + nSlot;
++  }
++
++  return UGPIOINT_SUCCESS;
++}
++
++/* =============================================================================
++**  Function : uGPIOIntInternal_DeconfigDirConn
++** ===========================================================================*/
++/**
++  Releases a TLMM DIR_CONN SENSORS slot previously claimed by
++  uGPIOIntInternal_ConfigDirConn() and disables the corresponding PDC
++  interrupt input. No-op if the GPIO is not DIR_CONN-routed.
++
++  @param[in]  nGpio   GPIO number
++
++  @return
++  None.
++
++  @dependencies
++  None.
++*/
++
++static void uGPIOIntInternal_DeconfigDirConn
++(
++  uint32_t nGpio
++)
++{
++  uintptr_t nAddr;
++  uint32_t  nPage = 0, nVal;
++  uint32_t  nSlot;
++
++  for (nSlot = 0; nSlot < UGPIOINT_DIRCONN_NUM_SLOTS; nSlot++)
++  {
++    if (nGpio == uGPIOIntDirConnSlots[nSlot])
++    {
++      break;
++    }
++  }
++
++  if (UGPIOINT_DIRCONN_NUM_SLOTS == nSlot)
++  {
++    return;
++  }
++
++  nAddr = HWIO_TLMM_DIR_CONN_INTRn_CFG_SENSORS_ADDR(TLMM_REG_REG_BASE, nSlot);
++
++  /* Program page select since we're accessing external registers */
++  if (nAddr & 0x80000000)
++  {
++    nPage = HWIO_INF(SDC_PAGE_SELECT, DDR_PAGE_SELECT);
++    HWIO_OUTF(SDC_PAGE_SELECT, DDR_PAGE_SELECT, 0);
++  }
++
++  /* Disconnect the slot (GPIO_SEL=0 selects a GPIO that is not routed) */
++  HWIO_TLMM_DIR_CONN_INTRn_CFG_SENSORS_OUTI(TLMM_REG_REG_BASE, nSlot, 0);
++
++  /* Stop routing the GPIO raw interrupt line to the DIR_CONN router */
++  nVal = in_dword(HWIO_ADDRX(
++           TLMM_REG_REG_BASE +
++             (nGpio * UGPIOINT_GPIO_OFFSET), TLMM_GPIO_INTR_CFG0));
++  nVal &= ~HWIO_TLMM_GPIO_INTR_CFG0_DIR_CONN_EN_BMSK;
++  out_dword(HWIO_ADDRX(
++              TLMM_REG_REG_BASE +
++                (nGpio * UGPIOINT_GPIO_OFFSET), TLMM_GPIO_INTR_CFG0), nVal);
++
++  /* Restore the page select config */
++  if (nAddr & 0x80000000)
++  {
++    HWIO_OUTF(SDC_PAGE_SELECT, DDR_PAGE_SELECT, nPage);
++  }
++
++  /* Disable the PDC interrupt input (no-op if never enabled) */
++  pdcInt_disable(UGPIOINT_DIRCONN_VECTOR_BASE + nSlot);
++
++  uGPIOIntDirConnSlots[nSlot] = UGPIOINT_DIRCONN_SLOT_FREE;
++}
++#endif /* UGPIOINT_DIRCONN_SUPPORT */
++
+ /* =============================================================================
+ **  Function : uGPIOIntInternal_ErrorCb
+ ** ===========================================================================*/
+@@ -264,6 +457,9 @@ static void uGPIOIntInternal_ErrorCb
+     if ( UGPIOINT_NONE != uGPIOIntData.aState[nIdx].nGpio)
+     {
+       pdcGpio_unconfig(uGPIOIntData.aState[nIdx].nGpio);
++      #ifdef UGPIOINT_DIRCONN_SUPPORT
++      uGPIOIntInternal_DeconfigDirConn(uGPIOIntData.aState[nIdx].nGpio);
++      #endif
+       #ifdef UGPIOTIMESTAMP_EN
+       if (uGPIOIntData.aState[nIdx].nFlags & UGPIOINTF_TIMESTAMP_EN)
+       {
+@@ -424,7 +620,15 @@ int32_t uGPIOIntInternal_ConfigPDC
+     pdcGpio_enable(nGpio);
+   }
+ 
+-  /* Not able to configure at PDC */
++  #ifdef UGPIOINT_DIRCONN_SUPPORT
++  /* GPIO is not in the PDC mux table - fall back to TLMM DIR_CONN */
++  else if (UGPIOINT_SUCCESS == uGPIOIntInternal_ConfigDirConn(nGpio, &nInt))
++  {
++    /* PDC interrupt input is enabled after registration (see below) */
++  }
++  #endif
++
++  /* Not able to configure at PDC nor via DIR_CONN */
+   else
+   {
+     return UGPIOINT_ERROR;
+@@ -496,6 +700,7 @@ int32_t uGPIOInt_RegisterInterrupt
+     if (INTERRUPT_TS_SUCCESS != InterruptControllerTimestamp_Config(nInt))
+     {
+       pdcGpio_unconfig(nGpio);
++      uGPIOIntInternal_DeconfigDirConn(nGpio);
+       uGPIOIntInternal_ClearFlags(nGpio, UGPIOINTF_ALL);
+       uGPIOIntData.aState[UGPIOINT_IDX(nGpio)].nGpio = UGPIOINT_NONE;
+       rex_leave_crit_sect(&uGPIOIntData.uGPIOIntLock);
+@@ -522,6 +727,7 @@ int32_t uGPIOInt_RegisterInterrupt
+   if (INTERRUPT_SUCCESS != nErr)
+   {
+     pdcGpio_unconfig(nGpio);
++    uGPIOIntInternal_DeconfigDirConn(nGpio);
+     uGPIOIntData.aState[UGPIOINT_IDX(nGpio)].nInterrupt = UGPIOINT_INT_NONE;
+     uGPIOIntInternal_ClearFlags(nGpio, UGPIOINTF_ALL);
+     uGPIOIntData.aState[UGPIOINT_IDX(nGpio)].nGpio = UGPIOINT_NONE;
+@@ -529,6 +735,22 @@ int32_t uGPIOInt_RegisterInterrupt
+     return UGPIOINT_ERROR;
+   }
+ 
++  #ifdef UGPIOINT_DIRCONN_SUPPORT
++  /*
++   * For a GPIO routed via DIR_CONN, enable the PDC interrupt input here:
++   * - pdcInt_enable() requires pdcInt_config() to have run first (it
++   *   validates drv_num in the PDC interrupt table), and pdcInt_config()
++   *   runs inside InterruptController_RegisterInterrupt() above.
++   * - The NVIC enable performed by registration short-circuits any later
++   *   InterruptController_EnableInterrupt() call (IsEnabled guard), so
++   *   the PDC side would never be enabled through the normal flow.
++   */
++  if (uGPIOIntData.aState[UGPIOINT_IDX(nGpio)].nFlags & UGPIOINTF_DIRCONN)
++  {
++    pdcInt_enable(uGPIOIntData.aState[UGPIOINT_IDX(nGpio)].nInterrupt);
++  }
++  #endif
++
+   uGPIOIntInternal_SetupFlags(nGpio, UGPIOINTF_REGISTERED);
+ 
+   rex_leave_crit_sect(&uGPIOIntData.uGPIOIntLock);
+@@ -590,6 +812,7 @@ int32_t uGPIOInt_DeregisterInterrupt
+   #endif
+ 
+   pdcGpio_unconfig(nGpio);
++  uGPIOIntInternal_DeconfigDirConn(nGpio);
+ 
+   #ifndef GPIOINT_NO_CONFIG_WAKEUPBITS
+   /* Un-set WAKEUP_ENABLE */
+@@ -615,7 +838,8 @@ int32_t uGPIOInt_DeregisterInterrupt
+   }
+   #endif
+ 
+-  uGPIOIntInternal_ClearFlags(nGpio, UGPIOINTF_DSR | UGPIOINTF_REGISTERED);
++  uGPIOIntInternal_ClearFlags(
++    nGpio, UGPIOINTF_DSR | UGPIOINTF_REGISTERED | UGPIOINTF_DIRCONN);
+   uGPIOIntData.aState[UGPIOINT_IDX(nGpio)].nInterrupt = UGPIOINT_INT_NONE;
+   uGPIOIntData.aState[UGPIOINT_IDX(nGpio)].nGpio = UGPIOINT_NONE;
+   uGPIOIntData.aGPIOLUT[nGpio] = UGPIOINT_NONE;
+diff --git a/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/common/sns_icm4x6xx_sensor_instance_island.c b/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/common/sns_icm4x6xx_sensor_instance_island.c
+index 4aca8c418..f883c912c 100755
+--- a/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/common/sns_icm4x6xx_sensor_instance_island.c
++++ b/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/common/sns_icm4x6xx_sensor_instance_island.c
+@@ -2052,7 +2052,9 @@ static uint32_t icm4x6xx_cal_valid_fifo_len(sns_sensor_instance *instance, const
+     if (valid_buf_len <= buf_len)
+     {
+       valid_buf_len_rc = valid_buf_len;
+-      (*cnt)++;
++      /* No standalone FSYNC records exist (DS-000347 §6.2): FSYNC is flagged
++       * on the first regular ODR packet after the edge, which is a sample too. */
++        (*cnt)++;
+     }
+   }
+ 
+@@ -2524,6 +2526,12 @@ void icm4x6xx_process_fifo_data_buffer(sns_sensor_instance *instance, const uint
+     }
+ 
+     header.head_byte = buf[idx];
++#ifdef ICM4X6XX_ENABLE_FSYNC
++    /* DS-000347 §6.2: field 11 flags the first ODR packet after an FSYNC edge.
++     * It is a regular sample packet; its 2 appended tmst bytes are the FSYNC
++     * time — grab them after the packet length is known (see below). */
++    bool is_fsync_pkt = ((header.timestamp_fsync & 0x03) == 0x03);
++#endif
+     INVN_INST_LOGV(
+       HIGH,
+       instance,
+@@ -2543,6 +2551,18 @@ void icm4x6xx_process_fifo_data_buffer(sns_sensor_instance *instance, const uint
+ 
+     idx += icm4x6xx_extract_fifo_packet(instance, buf, idx, header.head_byte, accel_raw, gyro_raw);
+ 
++#ifdef ICM4X6XX_ENABLE_FSYNC
++    if (is_fsync_pkt)
++    {
++      /* last 2 bytes of this packet are the FSYNC time (§6.1/§6.2) */
++      uint16_t fsync_tmst = (uint16_t)((buf[idx - 2] << 8) | buf[idx - 1]);
++      INVN_INST_LOGI(HIGH, instance, "fsync_tag tmst 0x%04x ts_sys 0x%x%08x",
++                     fsync_tmst,
++                     (uint32_t)(sns_get_system_time() >> 32),
++                     (uint32_t)sns_get_system_time());
++    }
++#endif
++
+     if (header.twenty_bits && (idx >= 2))
+     {
+       /* accel high resolution value, depends on accel_bit set or not*/
+@@ -2623,7 +2643,13 @@ void icm4x6xx_process_fifo_data_buffer(sns_sensor_instance *instance, const uint
+                                    sample_ts,
+                                    is_first_one,
+                                    is_last_one,
++#ifdef ICM4X6XX_ENABLE_FSYNC
++                                   /* TEMP DEBUG: mark the FSYNC-tagged sample as UNRELIABLE so
++                                    * it is visible in see_workhorse output (data still valid). */
++                                   is_fsync_pkt);
++#else
+                                    false);
++#endif
+ 
+     if (header.gyro)
+       icm4x6xx_handle_gyro_sample(instance,
+@@ -2633,7 +2659,11 @@ void icm4x6xx_process_fifo_data_buffer(sns_sensor_instance *instance, const uint
+                                   sample_ts,
+                                   is_first_one,
+                                   is_last_one,
++#ifdef ICM4X6XX_ENABLE_FSYNC
++                                  is_fsync_pkt);
++#else
+                                   false);
++#endif
+ 
+     if (packet_cnt == 0)
+       break;
+diff --git a/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_build_config.h b/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_build_config.h
+index 428ebf4cc..3f591ee33 100755
+--- a/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_build_config.h
++++ b/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_build_config.h
+@@ -75,6 +75,18 @@
+   #define ICM4X6XX_ODR_ADJUST_RATE 1.0f
+ #endif
+ 
++/* Enable FSYNC hardware sync: camera FSYNC(GPIO_183) -> IMU pin9 FSYNC input.
++ * Datasheet DS-000347 §6.2/§14.48: FSYNC time is tagged (header field 11) onto
++ * the FIRST regular ODR packet after the edge — no standalone FIFO record. */
++#define ICM4X6XX_ENABLE_FSYNC
++#ifdef ICM4X6XX_ENABLE_FSYNC
++  /* REG_FSYNC_CONFIG(0x62), DS-000347 §14.48 p.84:
++   *   bit[6:4] FSYNC_UI_SEL = 000 (do not tag FSYNC flag to UI sensor regs)
++   *   bit[1]   FSYNC_UI_FLAG_CLEAR_SEL = 0
++   *   bit[0]   FSYNC_POLARITY = 0 (rising edge of FSYNC pulse) */
++  #define ICM4X6XX_FSYNC_CONFIG_VAL 0x10
++#endif
++
+ /* FiFo Data Rate feature, Yoko C1 sensor support */
+ // #define ICM4X6XX_ENABLE_FDR
+ 
+diff --git a/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal.c b/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal.c
+index 5395faed6..de3df1fd4 100755
+--- a/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal.c
++++ b/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal.c
+@@ -566,6 +566,36 @@ sns_rc icm4x6xx_enable_tmst(sns_sensor_instance *instance, bool enable)
+ }
+ #endif /* ICM4X6XX_USE_INT_TS */
+ 
++#ifdef ICM4X6XX_ENABLE_FSYNC
++/**
++ * @brief enable/disable FSYNC timestamp capture (TMST_CONFIG bit1)
++ *
++ * Must be set independently of ICM4X6XX_USE_INT_TS: it latches the FSYNC edge
++ * into the TMST registers and allows FSYNC record generation into FIFO.
++ *
++ * @return 0 if success, non-zero value if failed.
++ */
++sns_rc icm4x6xx_enable_fsync_tmst(sns_sensor_instance *instance, bool enable)
++{
++  sns_rc rc = SNS_RC_SUCCESS;
++  uint32_t xfer_bytes;
++
++  INVN_INST_LOG_HAL(HIGH, instance, "enable_fsync_tmst %d", enable);
++
++  rc = icm4x6xx_write_mask(instance,
++                           REG_TMST_CONFIG_REG,
++                           enable ? BIT_TMST_FSYNC_EN : 0,
++                           &xfer_bytes,
++                           false,
++                           BIT_TMST_FSYNC_EN);
++
++  if (SNS_RC_SUCCESS != rc)
++    INVN_INST_LOGI(ERROR, instance, "enable_fsync_tmst fail rc %d", rc);
++
++  return rc;
++}
++#endif /* ICM4X6XX_ENABLE_FSYNC */
++
+ /**
+  * @brief Set fifo count and sensor data endianness.
+  *
+@@ -674,7 +704,7 @@ static sns_rc icm4x6xx_config_fsync(sns_sensor_instance *instance, uint8_t data)
+ 
+   INVN_INST_LOG_HAL(HIGH, instance, "config_fsync (data: 0x%x)", data);
+ 
+-  rc = icm4x6xx_write_mask(instance, REG_FSYNC_CONFIG, data, &xfer_bytes, false, 0x70);
++  rc = icm4x6xx_write_mask(instance, REG_FSYNC_CONFIG, data, &xfer_bytes, false, 0x73);
+ 
+   if (SNS_RC_SUCCESS != rc)
+     INVN_INST_LOGI(ERROR, instance, "config_fsync fail rc %d", rc);
+@@ -2181,8 +2211,37 @@ static sns_rc icm4x6xx_device_set_default_state(sns_sensor_instance *instance)
+   /* enable fifo hold last data */
+   rc += icm4x6xx_en_fifo_hold_last_data(instance, true);
+ 
++#ifdef ICM4X6XX_ENABLE_FSYNC
++  /* Enable FSYNC: config polarity/port selection, then force TMST_FSYNC_EN regardless of
++   * ICM4X6XX_USE_INT_TS, otherwise no FSYNC record is written into FIFO. */
++  rc += icm4x6xx_config_fsync(instance, ICM4X6XX_FSYNC_CONFIG_VAL);
++  rc += icm4x6xx_enable_fsync_tmst(instance, true);
++  /* Datasheet DS-000347 §15.18: pin9 reset default is INT2 (PIN9_FUNCTION=00);
++   * must select 01 = FSYNC input, bank1 INTF_CONFIG5(0x7B) bit[2:1]. */
++  {
++    uint32_t xfer_bytes;
++    rc += icm4x6xx_set_reg_bank(instance, 1);
++    rc += icm4x6xx_write_mask(instance, REG_INTF_CONFIG5,
++                              BIT_PIN9_FUNC_FSYNC, &xfer_bytes, false,
++                              BIT_PIN9_FUNC_MASK);
++    rc += icm4x6xx_set_reg_bank(instance, 0);
++  }
++  /* TEMP DEBUG: route UI_FSYNC interrupt to INT1 so each FSYNC edge raises
++   * GPIO81 — observable in /sys/kernel/debug/gpio without diag logs. */
++  {
++    uint32_t xfer_bytes;
++    rc += icm4x6xx_write_mask(instance, REG_INT_SOURCE0, FSYNC_INT1_EN_MASK,
++                              &xfer_bytes, false, FSYNC_INT1_EN_MASK);
++    /* TEMP DEBUG: latched INT1 mode (REG_INT_CONFIG INT1_MODE=1) so the edge
++     * holds INT1 high until the next int service — visible to AP polling. */
++    rc += icm4x6xx_write_mask(instance, REG_INT_CONFIG,
++                              INT1_LATCHED_MODE_MASK, &xfer_bytes, false,
++                              INT1_LATCHED_MODE_MASK);
++  }
++#else
+   /* do not tag fsync flag for temperature resolution */
+   rc += icm4x6xx_config_fsync(instance, 0);
++#endif
+ 
+   /* Choose Accel and Gyro FSR */
+   rc += icm4x6xx_set_imu_fsr(instance, &state->accel_info.fsr, &state->gyro_info.fsr);
+diff --git a/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal.h b/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal.h
+index a941e28f9..309b1daec 100755
+--- a/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal.h
++++ b/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal.h
+@@ -200,6 +200,8 @@
+     #define DRI_EN_MASK                 0x08
+     #define WM_INT_EN_MASK              0x04
+     #define FIFO_FULL_EN_MASK           0x02
++    /* TEMP DEBUG: FSYNC edge -> INT1 pulse, visible on SoC GPIO81 via debugfs */
++    #define FSYNC_INT1_EN_MASK          0x40
+ #define REG_INT_SOURCE1             0x66
+     #define WOM_EN_MASK                 0x07
+     #define SMD_EN_MASK                 0x08
+@@ -979,6 +981,9 @@ sns_rc icm4x6xx_config_sensor_group_delay(sns_sensor_instance *this);
+ #ifndef ICM4X6XX_USE_INT_TS
+ sns_rc icm4x6xx_read_tmst_val(sns_sensor_instance *instance, uint32_t *tmst_reg);
+ sns_rc icm4x6xx_enable_tmst_val(sns_sensor_instance *instance, bool enable);
++#ifdef ICM4X6XX_ENABLE_FSYNC
++sns_rc icm4x6xx_enable_fsync_tmst(sns_sensor_instance *instance, bool enable);
++#endif
+ #endif
+ #ifdef ICM4X6XX_ENABLE_SEE_RBX
+ sns_rc icm4x6xx_config_higher_odr_support(sns_sensor_instance *this);
+diff --git a/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal_island.c b/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal_island.c
+index d545ab8d2..bb4f330df 100755
+--- a/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal_island.c
++++ b/LPAIDSP.HT.1.1/adsp_proc/ssc_drivers/icm4x6xx/src/hal/sns_icm4x6xx_hal_island.c
+@@ -1069,11 +1069,18 @@ sns_rc icm4x6xx_en_fifo(sns_sensor_instance *instance, bool en_accel, bool en_gy
+ 
+   bit_mask = FIFO_ACCEL_EN_MASK | FIFO_GYRO_EN_MASK | FIFO_TEMP_EN_MASK | FIFO_HIRES_EN_MASK |
+              FIFO_WM_GT_TH_MASK;
++#ifdef ICM4X6XX_ENABLE_FSYNC
++  bit_mask |= FIFO_TMST_FSYNC_EN_MASK;
++#endif
+ 
+   reg = (en_accel ? FIFO_ACCEL_EN_MASK : 0) | (en_gyro ? FIFO_GYRO_EN_MASK : 0) |
+         ((en_accel || en_gyro) ? FIFO_TEMP_EN_MASK : 0) |
+         (state->product_info.use_hi_res ? ((en_accel || en_gyro) ? FIFO_HIRES_EN_MASK : 0) : 0) |
+         FIFO_WM_GT_TH_MASK;
++#ifdef ICM4X6XX_ENABLE_FSYNC
++  /* allow FSYNC edge to generate a standalone record into FIFO */
++  reg |= ((en_accel || en_gyro) ? FIFO_TMST_FSYNC_EN_MASK : 0);
++#endif
+ 
+   rc |= icm4x6xx_write_mask(instance, REG_FIFO_CONFIG_1, reg, &xfer_bytes, false, bit_mask);
+ 
+@@ -1754,6 +1761,14 @@ uint8_t icm4x6xx_extract_fifo_packet(sns_sensor_instance *instance, const uint8_
+   header.head_byte = head_byte;
+   pkt_len++;  /* FIFO header */
+ 
++#ifdef ICM4X6XX_ENABLE_FSYNC
++  /* Datasheet DS-000347 §6.2 (p.39): HEADER_TIMESTAMP_FSYNC bits3:2 is a
++   * 2-bit encoded field — 00: no tmst, 01: Reserved, 10: ODR timestamp,
++   * 11: FSYNC time (packet is the first ODR after the FSYNC edge).
++   * Both 10 and 11 append 2 tmst bytes to the packet; there is no standalone
++   * FSYNC record. FSYNC event = field == 11. */
++#endif
++
+   if (header.accel) /* accel data */
+   {
+     if (acc_buf)
+@@ -1770,7 +1785,11 @@ uint8_t icm4x6xx_extract_fifo_packet(sns_sensor_instance *instance, const uint8_
+ 
+   pkt_len += header.twenty_bits ? 2 : 1; /* temperature data */
+ 
++#ifdef ICM4X6XX_ENABLE_FSYNC
++  if (header.timestamp_fsync)  /* field 10 (ODR ts) or 11 (FSYNC ts): 2 bytes */
++#else
+   if (header.timestamp_fsync & 0x02)  /* timestamp data */
++#endif
+   {
+     #ifndef ICM4X6XX_USE_INT_TS
+     uint16_t pre_rec_cnt_16b = (uint16_t)(buf[idx + pkt_len] << 8 | buf[idx + pkt_len + 1]);
